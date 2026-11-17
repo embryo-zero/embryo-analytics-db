@@ -1,0 +1,90 @@
+#include <Columns/ColumnConst.h>
+#include <Columns/ColumnString.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Functions/FunctionFactory.h>
+#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
+
+#include <Common/logger_useful.h>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+}
+
+namespace
+{
+    class FunctionLogTrace final : public IFunction
+    {
+    public:
+        static constexpr auto name = "logTrace";
+        static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionLogTrace>(); }
+
+        [[nodiscard]] String getName() const override { return name; }
+
+        [[nodiscard]] size_t getNumberOfArguments() const override { return 1; }
+
+        [[nodiscard]] bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
+        [[nodiscard]] String getSignatureString() const override
+        {
+            return "(const String) -> UInt8";
+        }
+
+        [[nodiscard]] ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+        {
+            String message;
+            if (const ColumnConst * col = checkAndGetColumnConst<ColumnString>(arguments[0].column.get()))
+                message = col->getDataAt(0);
+            else
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "First argument for function {} must be Constant string",
+                    getName());
+
+            static auto log = getLogger("FunctionLogTrace");
+            LOG_TRACE(log, fmt::runtime(message));
+
+            return DataTypeUInt8().createColumnConst(input_rows_count, 0);
+        }
+    };
+
+}
+
+REGISTER_FUNCTION(LogTrace)
+{
+    FunctionDocumentation::Description description = R"(
+Emits a trace log message to the server log.
+
+The function accepts a constant argument only, so the call is evaluated during query analysis and replaced
+by its result. The message is therefore emitted once while the query is analyzed, and not once per processed
+[Block](/resources/develop-contribute/introduction/architecture#block): the number of rows and the setting `max_block_size` have no effect
+on how many messages appear in the log.
+    )";
+    FunctionDocumentation::Syntax syntax = "logTrace(message)";
+    FunctionDocumentation::Arguments arguments = {
+        {"message", "Message that is emitted to the server log.", {"const String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `0` always.", {"UInt8"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Basic example",
+        R"(
+SELECT logTrace('logTrace message');
+        )",
+        R"(
+┌─logTrace('logTrace message')─┐
+│                            0 │
+└──────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 12};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Introspection;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionLogTrace>(documentation);
+}
+
+}

@@ -1,0 +1,250 @@
+#include <Access/SettingsProfilesCache.h>
+#include <Access/AccessControl.h>
+#include <Access/SettingsProfile.h>
+#include <Access/SettingsProfilesInfo.h>
+#include <Access/resolveEffectiveSettings.h>
+#include <Common/Logger.h>
+#include <Common/ProfileEvents.h>
+#include <Common/Stopwatch.h>
+#include <Common/logger_useful.h>
+#include <Common/quoteString.h>
+
+
+namespace ProfileEvents
+{
+    /// NOLINT: not settings; the names contain "Settings" so check-settings-style mistakes them for setting externs.
+    extern const Event SettingsProfileCacheRecalculations; // NOLINT
+    extern const Event SettingsProfileCacheRecalculationMicroseconds; // NOLINT
+}
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int THERE_IS_NO_PROFILE;
+}
+
+SettingsProfilesCache::SettingsProfilesCache(const AccessControl & access_control_)
+    : access_control(access_control_) {}
+
+SettingsProfilesCache::~SettingsProfilesCache() = default;
+
+
+void SettingsProfilesCache::ensureAllProfilesRead()
+{
+    /// `mutex` is already locked.
+    if (all_profiles_read)
+        return;
+
+    subscription = access_control.subscribeForChanges<SettingsProfile>(
+        [this](const std::vector<AccessChangesNotifier::Change> & changes)
+        {
+            std::lock_guard lock{mutex};
+            for (const auto & change : changes)
+            {
+                if (change.entity)
+                    profileAddedOrChanged(change.id, typeid_cast<SettingsProfilePtr>(change.entity));
+                else
+                    profileRemoved(change.id);
+            }
+            mergeSettingsAndConstraintsIfNeeded();
+        });
+
+    /// Start clean: a previous attempt may have thrown mid-scan.
+    all_profiles.clear();
+    profiles_by_name.clear();
+    for (const UUID & id : access_control.findAll<SettingsProfile>())
+    {
+        auto profile = access_control.tryRead<SettingsProfile>(id);
+        if (profile)
+        {
+            all_profiles.emplace(id, profile);
+            profiles_by_name[profile->getName()] = id;
+        }
+    }
+
+    /// Set only after the subscription and the initial read succeed.
+    all_profiles_read = true;
+}
+
+
+void SettingsProfilesCache::profileAddedOrChanged(const UUID & profile_id, const SettingsProfilePtr & new_profile)
+{
+    /// `mutex` is already locked.
+    auto it = all_profiles.find(profile_id);
+    if (it == all_profiles.end())
+    {
+        all_profiles.emplace(profile_id, new_profile);
+        profiles_by_name[new_profile->getName()] = profile_id;
+    }
+    else
+    {
+        auto old_profile = it->second;
+        it->second = new_profile;
+        if (old_profile->getName() != new_profile->getName())
+            profiles_by_name.erase(old_profile->getName());
+        profiles_by_name[new_profile->getName()] = profile_id;
+    }
+    profile_infos_cache.clear();
+    need_merge_settings_and_constraints = true;
+}
+
+
+void SettingsProfilesCache::profileRemoved(const UUID & profile_id)
+{
+    /// `mutex` is already locked.
+    auto it = all_profiles.find(profile_id);
+    if (it == all_profiles.end())
+        return;
+    profiles_by_name.erase(it->second->getName());
+    all_profiles.erase(it);
+    profile_infos_cache.clear();
+    need_merge_settings_and_constraints = true;
+}
+
+
+void SettingsProfilesCache::setDefaultProfileName(const String & default_profile_name)
+{
+    std::lock_guard lock{mutex};
+    ensureAllProfilesRead();
+
+    if (default_profile_name.empty())
+    {
+        default_profile_id = {};
+        return;
+    }
+
+    auto it = profiles_by_name.find(default_profile_name);
+    if (it == profiles_by_name.end())
+        throw Exception(ErrorCodes::THERE_IS_NO_PROFILE, "Settings profile {} not found", backQuote(default_profile_name));
+
+    default_profile_id = it->second;
+}
+
+
+void SettingsProfilesCache::mergeSettingsAndConstraintsIfNeeded()
+{
+    /// `mutex` is already locked.
+    if (!need_merge_settings_and_constraints)
+        return;
+    /// Clear the flag only after a successful rebuild, so a throwing recompute is retried next batch.
+    mergeSettingsAndConstraints();
+    need_merge_settings_and_constraints = false;
+}
+
+
+void SettingsProfilesCache::mergeSettingsAndConstraints()
+{
+    /// `mutex` is already locked.
+    ProfileEvents::increment(ProfileEvents::SettingsProfileCacheRecalculations);
+    Stopwatch watch;
+    for (auto i = enabled_settings.begin(), e = enabled_settings.end(); i != e;)
+    {
+        auto enabled = i->second.lock();
+        if (!enabled)
+            i = enabled_settings.erase(i);
+        else
+        {
+            mergeSettingsAndConstraintsFor(*enabled);
+            ++i;
+        }
+    }
+
+    const auto elapsed_ms = watch.elapsedMilliseconds();
+    ProfileEvents::increment(ProfileEvents::SettingsProfileCacheRecalculationMicroseconds, watch.elapsedMicroseconds());
+    /// O(enabled sets * profiles), under `mutex` that the ContextAccess build path also takes.
+    if (elapsed_ms >= 1000)
+        LOG_DEBUG(getLogger("SettingsProfilesCache"), "Re-merged settings and constraints for {} enabled set(s) over {} profiles in {} ms", enabled_settings.size(), all_profiles.size(), elapsed_ms);
+    else
+        LOG_TRACE(getLogger("SettingsProfilesCache"), "Re-merged settings and constraints for {} enabled set(s) over {} profiles in {} ms", enabled_settings.size(), all_profiles.size(), elapsed_ms);
+}
+
+
+void SettingsProfilesCache::mergeSettingsAndConstraintsFor(EnabledSettings & enabled) const
+{
+    auto resolved = resolveSettingsProfileElements(
+        default_profile_id,
+        all_profiles,
+        enabled.params.user_id,
+        enabled.params.enabled_roles,
+        enabled.params.settings_from_enabled_roles,
+        enabled.params.settings_from_user,
+        [&](const UUID & profile_id) { return access_control.shouldSkipSQLAccessEntityForUser(profile_id, enabled.params.user_id); });
+
+    auto info = std::make_shared<SettingsProfilesInfo>(access_control);
+    info->profiles = std::move(resolved.profiles);
+    info->profiles_with_implicit = std::move(resolved.substituted_profiles);
+    info->names_of_profiles = std::move(resolved.names_of_substituted_profiles);
+    info->settings = resolved.elements.toSettingsChanges();
+    info->constraints = resolved.elements.toSettingsConstraints(access_control);
+
+    enabled.setInfo(std::move(info));
+}
+
+
+std::optional<UUID> SettingsProfilesCache::getDefaultProfileId() const
+{
+    std::lock_guard lock{mutex};
+    return default_profile_id;
+}
+
+
+std::shared_ptr<const EnabledSettings> SettingsProfilesCache::getEnabledSettings(
+    const UUID & user_id,
+    const SettingsProfileElements & settings_from_user,
+    const boost::container::flat_set<UUID> & enabled_roles,
+    const SettingsProfileElements & settings_from_enabled_roles)
+{
+    std::lock_guard lock{mutex};
+    ensureAllProfilesRead();
+
+    EnabledSettings::Params params;
+    params.user_id = user_id;
+    params.settings_from_user = settings_from_user;
+    params.enabled_roles = enabled_roles;
+    params.settings_from_enabled_roles = settings_from_enabled_roles;
+
+    auto it = enabled_settings.find(params);
+    if (it != enabled_settings.end())
+    {
+        auto from_cache = it->second.lock();
+        if (from_cache)
+            return from_cache;
+        enabled_settings.erase(it);
+    }
+
+    std::shared_ptr<EnabledSettings> res(new EnabledSettings(params));
+    enabled_settings.emplace(std::move(params), res);
+    mergeSettingsAndConstraintsFor(*res);
+    return res;
+}
+
+
+std::shared_ptr<const SettingsProfilesInfo> SettingsProfilesCache::getSettingsProfileInfo(const UUID & profile_id)
+{
+    std::lock_guard lock{mutex};
+    ensureAllProfilesRead();
+
+    if (auto pos = this->profile_infos_cache.get(profile_id))
+        return *pos;
+
+    SettingsProfileElements elements;
+    auto & element = elements.emplace_back();
+    element.parent_profile = profile_id;
+
+    auto info = std::make_shared<SettingsProfilesInfo>(access_control);
+
+    auto get_profile = [this](const UUID & id) -> SettingsProfilePtr
+    {
+        auto it = all_profiles.find(id);
+        return it == all_profiles.end() ? nullptr : it->second;
+    };
+    DB::substituteProfiles(elements, get_profile, info->profiles, info->profiles_with_implicit, info->names_of_profiles);
+    info->settings = elements.toSettingsChanges();
+    info->constraints.merge(elements.toSettingsConstraints(access_control));
+
+    profile_infos_cache.add(profile_id, info);
+    return info;
+}
+
+}

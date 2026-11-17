@@ -1,0 +1,180 @@
+#pragma once
+
+#include <Common/VectorWithMemoryTracking.h>
+#include <Core/Block_fwd.h>
+#include <Processors/IProcessor_fwd.h>
+
+#include <functional>
+
+namespace DB
+{
+
+class Chain;
+class EnabledQuota;
+class Field;
+struct StreamLocalLimits;
+
+class Pipe;
+using Pipes = std::vector<Pipe>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+
+class ReadProgressCallback;
+
+using OutputPortRawPtrs = std::vector<OutputPort *>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+using InputPortRawPtrs = std::vector<InputPort *>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+
+/// Pipe is a set of processors which represents the part of pipeline.
+/// Pipe contains a list of output ports, with specified port for totals and specified port for extremes.
+/// All output ports have same header.
+/// All other ports are connected, all connections are inside processors set.
+class Pipe
+{
+public:
+    /// Default constructor creates empty pipe. Generally, you cannot do anything with it except to check it is empty().
+    /// You cannot get empty pipe in any other way. All transforms check that result pipe is not empty.
+    Pipe();
+    /// Create from source. Source must have no input ports and single output.
+    explicit Pipe(ProcessorPtr source);
+    /// Create from source with specified totals end extremes (may be nullptr). Ports should be owned by source.
+    explicit Pipe(ProcessorPtr source, OutputPort * output, OutputPort * totals, OutputPort * extremes);
+    /// Create from processors of a seal-gated read: like the ctor from processors, but the
+    /// given input port is allowed to stay disconnected and is registered as a pending seal
+    /// input (it is connected to the build-side seal of the nearest join marked as gating;
+    /// a pending input which is never wired is terminated on pipeline completion and the
+    /// read proceeds unfiltered).
+    Pipe(std::shared_ptr<Processors> processors_, InputPort * pending_seal_input_);
+    /// Create from processors. Use all not-connected output ports as output_ports. Check invariants.
+    explicit Pipe(std::shared_ptr<Processors> processors_);
+
+    Pipe(const Pipe & other) = delete;
+    Pipe(Pipe && other) = default;
+    Pipe & operator=(const Pipe & other) = delete;
+    Pipe & operator=(Pipe && other) = default;
+
+    [[nodiscard]] const Block & getHeader() const { return *header; }
+    [[nodiscard]] const SharedHeader & getSharedHeader() const { return header; }
+    [[nodiscard]] bool empty() const { return processors->empty(); }
+    [[nodiscard]] size_t numOutputPorts() const { return output_ports.size(); }
+    [[nodiscard]] size_t maxParallelStreams() const { return max_parallel_streams; }
+    [[nodiscard]] OutputPort * getOutputPort(size_t pos) const { return output_ports[pos]; }
+    [[nodiscard]] OutputPort * getTotalsPort() const { return totals_port; }
+    [[nodiscard]] OutputPort * getExtremesPort() const { return extremes_port; }
+
+    /// The seal inputs of gated reads (see SealGatedReadTransform). They stay disconnected
+    /// until a join marked as gating its probe side connects all of them to its build-side
+    /// seal. Each gated read contributes exactly one (it fans the seal out to its streams
+    /// with its own copy transform), but a probe subtree may unite several gated reads and
+    /// unmarked joins carry the inputs of both of their children upward.
+    [[nodiscard]] const InputPortRawPtrs & getPendingSealInputs() const { return pending_seal_inputs; }
+
+    /// Add processor to list, add it output ports to output_ports.
+    /// Processor shouldn't have input ports, output ports shouldn't be connected.
+    /// Output headers should have same structure and be compatible with current header (if not empty()).
+    void addSource(ProcessorPtr source);
+
+    /// Add totals and extremes.
+    void addTotalsSource(ProcessorPtr source);
+    void addExtremesSource(ProcessorPtr source);
+
+    /// Drop totals and extremes. All three discard through a `DroppingTransform` on the data path.
+    void dropTotals();
+    void dropExtremes();
+    void dropTotalsAndExtremes();
+
+    /// Take the extremes stream out of the pipe, so that the following transforms do not process it, and put it back
+    /// with `attachExtremes`, through `converting` (may be nullptr) if the header has changed meanwhile.
+    /// The processors producing the extremes stay in the pipe. The pipe cannot be united while the extremes are detached.
+    void detachExtremes();
+    [[nodiscard]] OutputPort * getDetachedExtremesPort() const { return detached_extremes_port; }
+    void attachExtremes(ProcessorPtr converting);
+
+    /// Add processor to list. It should have size() input ports with compatible header.
+    /// Output ports should have same headers.
+    /// If totals or extremes are not empty, transform shouldn't change header.
+    void addTransform(ProcessorPtr transform);
+    void addTransform(ProcessorPtr transform, OutputPort * totals, OutputPort * extremes);
+    void addTransform(ProcessorPtr transform, InputPort * totals, InputPort * extremes);
+
+    void addTransform(
+        ProcessorPtr transform,
+        InputPort * totals_in, InputPort * extremes_in,
+        OutputPort * totals_out, OutputPort * extremes_out);
+
+    enum class StreamType : uint8_t
+    {
+        Main = 0, /// Stream for query data. There may be several streams of this type.
+        Totals,  /// Stream for totals. No more than one.
+        Extremes, /// Stream for extremes. No more than one.
+    };
+
+    using ProcessorGetterSharedHeader = std::function<ProcessorPtr(const SharedHeader & header)>;
+    using ProcessorGetterSharedHeaderWithStreamKind = std::function<ProcessorPtr(const SharedHeader & header, StreamType stream_type)>;
+
+    /// Add transform with single input and single output for each port.
+    void addSimpleTransform(const ProcessorGetterSharedHeader & getter);
+    void addSimpleTransform(const ProcessorGetterSharedHeaderWithStreamKind & getter);
+
+    /// Add chain to every output port.
+    void addChains(VectorWithMemoryTracking<Chain> chains);
+
+    /// Changes the number of output ports if needed. Adds (Strict)ResizeProcessor.
+    void resize(size_t num_streams, bool strict = false, UInt64 min_outstreams_per_resize_after_split = 0);
+
+    /// Watermark-aware pair to resize. Adds CalibrateWatermarksProcessor.
+    void calibrateWatermarks(size_t num_streams, const Field & initial_watermark);
+
+    using Transformer = std::function<Processors(const OutputPortRawPtrs & ports)>;
+
+    /// Transform Pipe in general way.
+    void transform(const Transformer & transformer, bool check_ports = true);
+
+    /// Unite several pipes together. They should have same header.
+    static Pipe unitePipes(Pipes pipes);
+
+    /// Get processors from Pipe. Use it with caution, it is easy to lose totals and extremes ports.
+    static Processors detachProcessors(Pipe pipe) { return *std::move(pipe.processors); }
+    /// Get processors from Pipe without destroying pipe (used for EXPLAIN to keep QueryPlan).
+    [[nodiscard]] const Processors & getProcessors() const { return *processors; }
+
+    std::shared_ptr<Processors> getProcessorsPtr() { return processors; }
+
+private:
+    /// Header is common for all output below.
+    SharedHeader header;
+    std::shared_ptr<Processors> processors;
+
+    /// Output ports. Totals and extremes are allowed to be empty.
+    OutputPortRawPtrs output_ports;
+    OutputPort * totals_port = nullptr;
+    OutputPort * extremes_port = nullptr;
+    /// See detachExtremes.
+    OutputPort * detached_extremes_port = nullptr;
+    bool extremes_detached = false;
+
+    /// See getPendingSealInputs.
+    InputPortRawPtrs pending_seal_inputs;
+
+    /// It is the max number of processors which can be executed in parallel for each step.
+    /// Usually, it's the same as the number of output ports.
+    size_t max_parallel_streams = 0;
+
+    /// If is set, all newly created processors will be added to this too.
+    /// It is needed for debug. See QueryPipelineProcessorsCollector.
+    Processors * collected_processors = nullptr;
+
+    /// Discards the requested streams through a `DroppingTransform`. Requires a data output to forward,
+    /// which holds for every caller: totals and extremes can only be added to a non-empty pipe, and
+    /// `addTransform` rejects an empty one.
+    void dropStreams(bool drop_totals, bool drop_extremes);
+
+    /// This methods are for QueryPipeline. It is allowed to complete graph only there.
+    /// So, we may be sure that Pipe always has output port if not empty.
+    [[nodiscard]] bool isCompleted() const { return !empty() && output_ports.empty(); }
+    static Pipe unitePipes(Pipes pipes, Processors * collected_processors, bool allow_empty_header);
+    void setSinks(const Pipe::ProcessorGetterSharedHeaderWithStreamKind & getter);
+    void addSplitResizeTransform(size_t num_streams, size_t min_outstreams_per_resize_after_split, bool strict);
+
+    friend class QueryPipelineBuilder;
+    friend class QueryPipeline;
+};
+
+}

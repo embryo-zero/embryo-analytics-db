@@ -1,0 +1,196 @@
+#pragma once
+#include <DataTypes/DataTypesNumber.h>
+#include <Functions/IFunction.h>
+#include <Functions/FunctionHelpers.h>
+#include <Columns/ColumnVector.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnFixedString.h>
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnMap.h>
+#include <Columns/ColumnQBit.h>
+#include <Columns/ColumnsNumber.h>
+#include <Interpreters/Context_fwd.h>
+
+
+namespace DB
+{
+
+namespace ErrorCodes
+{
+    extern const int ILLEGAL_COLUMN;
+}
+
+
+template <typename Impl, typename Name, typename ResultType, bool is_suitable_for_short_circuit_arguments_execution = true>
+class FunctionStringOrArrayToT final : public IFunction
+{
+public:
+    static constexpr auto name = Name::name;
+    static FunctionPtr create(ContextPtr) { return createImpl(); }
+    static FunctionPtr createImpl()
+    {
+        return std::make_shared<FunctionStringOrArrayToT>();
+    }
+
+    [[nodiscard]] String getName() const override
+    {
+        return name;
+    }
+
+    [[nodiscard]] size_t getNumberOfArguments() const override
+    {
+        return 1;
+    }
+
+    [[nodiscard]] bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override
+    {
+        return is_suitable_for_short_circuit_arguments_execution;
+    }
+
+    /// Whether the Impl opts into handling the QBit data type (returns a constant equal to the vector dimension).
+    static constexpr bool supportsQBit()
+    {
+        if constexpr (requires { Impl::supports_qbit; })
+            return Impl::supports_qbit;
+        return false;
+    }
+
+    [[nodiscard]] bool isVolumeReducing() const override
+    {
+        if constexpr (requires { Impl::is_volume_reducing; })
+            return Impl::is_volume_reducing;
+        return false;
+    }
+
+    [[nodiscard]] String getSignatureString() const override
+    {
+        /// `QBit` is accepted only by Impls that opt in (e.g. `length`): there the result is a
+        /// constant equal to the vector dimension, but its type is still the numeric `ResultType`,
+        /// so the same `-> ResultType` return applies and the dimension constant is produced in `executeImpl`.
+        if constexpr (supportsQBit())
+            return "(String | FixedString | Array | Map | UUID | IPv4 | IPv6 | QBit) -> " + DataTypeNumber<ResultType>{}.getName();
+        return "(String | FixedString | Array | Map | UUID | IPv4 | IPv6) -> " + DataTypeNumber<ResultType>{}.getName();
+    }
+
+    [[nodiscard]] DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
+        return std::make_shared<DataTypeNumber<ResultType>>();
+    }
+
+    [[nodiscard]] bool useDefaultImplementationForConstants() const override { return true; }
+
+    [[nodiscard]] bool hasInformationAboutMonotonicity() const override
+    {
+        if constexpr (requires { Impl::has_information_about_monotonicity; })
+            return Impl::has_information_about_monotonicity;
+        return false;
+    }
+
+    [[nodiscard]] Monotonicity getMonotonicityForRange(const IDataType & type, const Field & left, const Field & right) const override
+    {
+        if constexpr (requires(const IDataType & t, const Field & f) { Impl::getMonotonicityForRange(t, f, f); })
+            return Impl::getMonotonicityForRange(type, left, right);
+        return {};
+    }
+
+    [[nodiscard]] std::optional<bool> canThrowIfKnown(const DataTypesWithConstInfo & arguments) const override
+    {
+        if constexpr (requires(const DataTypesWithConstInfo & a) { Impl::canThrowIfKnown(a); })
+            return Impl::canThrowIfKnown(arguments);
+        return {};
+    }
+
+    [[nodiscard]] ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+    {
+        const ColumnPtr column = arguments[0].column;
+        if (const ColumnString * col = checkAndGetColumn<ColumnString>(column.get()))
+        {
+            auto col_res = ColumnVector<ResultType>::create();
+
+            typename ColumnVector<ResultType>::Container & vec_res = col_res->getData();
+            vec_res.resize(col->size());
+            Impl::vector(col->getChars(), col->getOffsets(), vec_res, input_rows_count);
+
+            return col_res;
+        }
+        if (const ColumnFixedString * col_fixed = checkAndGetColumn<ColumnFixedString>(column.get()))
+        {
+            if (Impl::is_fixed_to_constant)
+            {
+                /// Result is derived from N (a type property), not from data, so it is valid even for 0 rows.
+                /// Impls reaching this branch must not read data, hence no bounds risk on an empty buffer.
+                ResultType res = 0;
+                Impl::vectorFixedToConstant(col_fixed->getChars(), col_fixed->getN(), res, input_rows_count);
+
+                return result_type->createColumnConst(col_fixed->size(), toField(res));
+            }
+
+            auto col_res = ColumnVector<ResultType>::create();
+
+            typename ColumnVector<ResultType>::Container & vec_res = col_res->getData();
+            vec_res.resize(col_fixed->size());
+            Impl::vectorFixedToVector(col_fixed->getChars(), col_fixed->getN(), vec_res, input_rows_count);
+
+            return col_res;
+        }
+        if constexpr (supportsQBit())
+        {
+            if (const ColumnQBit * col_qbit = checkAndGetColumn<ColumnQBit>(column.get()))
+            {
+                /// Dimension is a type property, valid even for 0 rows (same reason as the FixedString branch).
+                ResultType res = 0;
+                Impl::qbitToConstant(col_qbit->getDimension(), res);
+
+                return result_type->createColumnConst(col_qbit->size(), toField(res));
+            }
+        }
+        if (const ColumnArray * col_arr = checkAndGetColumn<ColumnArray>(column.get()))
+        {
+            auto col_res = ColumnVector<ResultType>::create();
+
+            typename ColumnVector<ResultType>::Container & vec_res = col_res->getData();
+            vec_res.resize(col_arr->size());
+            Impl::array(col_arr->getOffsets(), vec_res, input_rows_count);
+
+            return col_res;
+        }
+        if (const ColumnMap * col_map = checkAndGetColumn<ColumnMap>(column.get()))
+        {
+            auto col_res = ColumnVector<ResultType>::create();
+            typename ColumnVector<ResultType>::Container & vec_res = col_res->getData();
+            vec_res.resize(col_map->size());
+            const auto & col_nested = col_map->getNestedColumn();
+
+            Impl::array(col_nested.getOffsets(), vec_res, input_rows_count);
+            return col_res;
+        }
+        if (const ColumnUUID * col_uuid = checkAndGetColumn<ColumnUUID>(column.get()))
+        {
+            auto col_res = ColumnVector<ResultType>::create();
+            typename ColumnVector<ResultType>::Container & vec_res = col_res->getData();
+            vec_res.resize(col_uuid->size());
+            Impl::uuid(col_uuid->getData(), input_rows_count, vec_res, input_rows_count);
+            return col_res;
+        }
+        if (const ColumnIPv6 * col_ipv6 = checkAndGetColumn<ColumnIPv6>(column.get()))
+        {
+            auto col_res = ColumnVector<ResultType>::create();
+            typename ColumnVector<ResultType>::Container & vec_res = col_res->getData();
+            vec_res.resize(col_ipv6->size());
+            Impl::ipv6(col_ipv6->getData(), input_rows_count, vec_res, input_rows_count);
+            return col_res;
+        }
+        if (const ColumnIPv4 * col_ipv4 = checkAndGetColumn<ColumnIPv4>(column.get()))
+        {
+            auto col_res = ColumnVector<ResultType>::create();
+            typename ColumnVector<ResultType>::Container & vec_res = col_res->getData();
+            vec_res.resize(col_ipv4->size());
+            Impl::ipv4(col_ipv4->getData(), input_rows_count, vec_res, input_rows_count);
+            return col_res;
+        }
+        throw Exception(
+            ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}", arguments[0].column->getName(), getName());
+    }
+};
+
+}

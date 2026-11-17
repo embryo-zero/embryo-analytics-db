@@ -1,0 +1,100 @@
+#include <Columns/ColumnFixedString.h>
+#include <DataTypes/DataTypeFixedString.h>
+#include <Functions/FunctionFactory.h>
+#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
+#include <Functions/FunctionsRandom.h>
+#include <pcg_random.hpp>
+#include <Common/randomSeed.h>
+#include <base/arithmeticOverflow.h>
+#include <base/unaligned.h>
+
+#include <base/defines.h>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int DECIMAL_OVERFLOW;
+}
+
+namespace
+{
+
+/* Generate random fixed string with fully random bytes (including zero). */
+class FunctionRandomFixedString : public IFunction
+{
+public:
+    static constexpr auto name = "randomFixedString";
+
+    static FunctionPtr create(ContextPtr)
+    {
+        return std::make_shared<FunctionRandomFixedString>();
+    }
+
+    [[nodiscard]] String getName() const override { return name; }
+
+    [[nodiscard]] bool isVariadic() const override { return false; }
+
+    [[nodiscard]] bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
+    [[nodiscard]] size_t getNumberOfArguments() const override { return 1; }
+
+    [[nodiscard]] String getSignatureString() const override
+    {
+        return "(const N NativeUInt) -> FixedString(N)";
+    }
+
+    [[nodiscard]] bool isDeterministic() const override { return false; }
+    [[nodiscard]] bool isDeterministicInScopeOfQuery() const override { return false; }
+
+    [[nodiscard]] ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        const size_t n = assert_cast<const ColumnConst &>(*arguments[0].column).getValue<UInt64>();
+
+        auto col_to = ColumnFixedString::create(n);
+        ColumnFixedString::Chars & data_to = col_to->getChars();
+
+        if (input_rows_count == 0)
+            return col_to;
+
+        size_t total_size = 0;
+        if (common::mulOverflow(input_rows_count, n, total_size))
+            throw Exception(ErrorCodes::DECIMAL_OVERFLOW, "Decimal math overflow");
+
+        /// Fill random bytes.
+        data_to.resize(total_size);
+        RandImpl::execute(reinterpret_cast<char *>(data_to.data()), total_size);
+
+        return col_to;
+    }
+};
+
+}
+
+REGISTER_FUNCTION(RandomFixedString)
+{
+    FunctionDocumentation::Description description = R"(
+Generates a random fixed-size string with the specified number of character.
+The returned characters are not necessarily ASCII characters, i.e. they may not be printable.
+    )";
+    FunctionDocumentation::Syntax syntax = "randomFixedString(length)";
+    FunctionDocumentation::Arguments arguments = {
+        {"length", "Length of the string in bytes.", {"UInt*"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns a string filled with random bytes.", {"FixedString"}};
+    FunctionDocumentation::Examples examples = {
+        {"Usage example", "SELECT randomFixedString(13) AS rnd, toTypeName(rnd)", R"(
+┌─rnd────────┬─toTypeName(randomFixedString(13))─┐
+│ j▒h㋖HɨZ'▒ │ FixedString(13)                   │
+└────────────┴───────────────────────────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 5};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::RandomNumber;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionRandomFixedString>(documentation);
+}
+
+}

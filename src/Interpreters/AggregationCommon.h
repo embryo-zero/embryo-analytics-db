@@ -1,0 +1,446 @@
+#pragma once
+
+#include <Common/Exception.h>
+#include <Common/assert_cast.h>
+#include <Core/Defines.h>
+#include <Columns/IColumn.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnsNumber.h>
+#include <Interpreters/KeysNullMap.h>
+
+#if defined(__SSSE3__) && !defined(MEMORY_SANITIZER)
+#include <tmmintrin.h>
+#endif
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
+class Arena;
+
+using Sizes = std::vector<size_t>;
+
+/// When packing the values of nullable columns at a given row, we have to
+/// store the fact that these values are nullable or not. This is achieved
+/// by encoding this information as a bitmap. Let S be the size in bytes of
+/// a packed values binary blob and T the number of bytes we may place into
+/// this blob, the size that the bitmap shall occupy in the blob is equal to:
+/// ceil(T/8). Thus we must have: S = T + ceil(T/8). Below we indicate for
+/// each value of S, the corresponding value of T, and the bitmap size:
+///
+/// 32,28,4
+/// 16,14,2
+/// 8,7,1
+/// 4,3,1
+/// 2,1,1
+///
+
+template<typename T, size_t step>
+void fillFixedBatch(size_t num_rows, const T * source, T * dest)
+{
+    for (size_t i = 0; i < num_rows; ++i)
+    {
+        *dest = *source;
+        ++source;
+        dest += step;
+    }
+}
+
+/// Move keys of size T into binary blob, starting from offset.
+/// It is assumed that offset is aligned to sizeof(T).
+/// Example: sizeof(key) = 16, sizeof(T) = 4, offset = 8
+/// out[0] : [--------****----]
+/// out[1] : [--------****----]
+/// ...
+template<typename T, typename Key>
+void fillFixedBatch(size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes, PaddedPODArray<Key> & out, size_t & offset)
+{
+    for (size_t i = 0; i < keys_size; ++i)
+    {
+        if (key_sizes[i] == sizeof(T))
+        {
+            const auto * column = key_columns[i];
+            size_t num_rows = column->size();
+            out.resize_fill(num_rows);
+
+            /// Note: here we violate strict aliasing.
+            /// It should be ok as long as we do not refer to any value from `out` before filling.
+            const char * source = static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<sizeof(T)>();
+            T * dest = reinterpret_cast<T *>(reinterpret_cast<char *>(out.data()) + offset);
+            fillFixedBatch<T, sizeof(Key) / sizeof(T)>(num_rows, reinterpret_cast<const T *>(source), dest);
+            offset += sizeof(T);
+        }
+    }
+}
+
+/// Pack into a binary blob of type T a set of fixed-size keys. Granted that all the keys fit into the
+/// binary blob. Keys are placed starting from the longest one.
+template <typename T>
+void packFixedBatch(size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes, PaddedPODArray<T> & out)
+{
+    size_t offset = 0;
+    fillFixedBatch<UInt128>(keys_size, key_columns, key_sizes, out, offset);
+    fillFixedBatch<UInt64>(keys_size, key_columns, key_sizes, out, offset);
+    fillFixedBatch<UInt32>(keys_size, key_columns, key_sizes, out, offset);
+    fillFixedBatch<UInt16>(keys_size, key_columns, key_sizes, out, offset);
+    fillFixedBatch<UInt8>(keys_size, key_columns, key_sizes, out, offset);
+}
+
+/// The inverse of the fixed-size key packing above: writes the values of the key columns (and their
+/// null map, if any of the keys is nullable) from the packed key back into the columns.
+template <bool has_nullable_keys, typename Key>
+void unpackFixedKeyIntoColumns(const Key & key, const std::vector<size_t> * unpack_order, std::vector<IColumn *> & key_columns, const Sizes & key_sizes)
+{
+    static constexpr auto bitmap_size = has_nullable_keys ? std::tuple_size_v<KeysNullMap<Key>> : 0;
+
+    /// In any hash key value, column values to be read start just after the bitmap, if it exists.
+    size_t pos = bitmap_size;
+
+    for (size_t j = 0; j < key_columns.size(); ++j)
+    {
+        const size_t i = unpack_order ? (*unpack_order)[j] : j;
+
+        IColumn * observed_column = key_columns[i];
+        ColumnUInt8 * null_map = nullptr;
+
+        bool column_nullable = false;
+        if constexpr (has_nullable_keys)
+            column_nullable = isColumnNullable(*key_columns[i]);
+
+        /// If we have a nullable column, get its nested column and its null map.
+        if (column_nullable)
+        {
+            auto & nullable_col = assert_cast<ColumnNullable &>(*key_columns[i]);
+            observed_column = &nullable_col.getNestedColumn();
+            null_map = assert_cast<ColumnUInt8 *>(&nullable_col.getNullMapColumn());
+        }
+
+        bool is_null = false;
+        if (column_nullable)
+        {
+            /// The current column is nullable. Check if the value of the
+            /// corresponding key is nullable. Update the null map accordingly.
+            size_t bucket = i / 8;
+            size_t offset = i % 8;
+            UInt8 val = (reinterpret_cast<const UInt8 *>(&key)[bucket] >> offset) & 1;
+            null_map->insertValue(val);
+            is_null = val == 1;
+        }
+
+        if (has_nullable_keys && is_null)
+        {
+            observed_column->insertDefault();
+        }
+        else
+        {
+            size_t size = key_sizes[i];
+            observed_column->insertData(reinterpret_cast<const char *>(&key) + pos, size);
+            pos += size;
+        }
+    }
+}
+
+/// Same as fillFixedBatch, but only over rows [begin, end): `out` holds one element per row of that
+/// range, so its element `i` is row `begin + i`.
+template <typename T, typename Key>
+void fillFixedBatchRange(
+    size_t keys_size,
+    const ColumnRawPtrs & key_columns,
+    const Sizes & key_sizes,
+    size_t begin,
+    size_t end,
+    PaddedPODArray<Key> & out,
+    size_t & offset)
+{
+    for (size_t i = 0; i < keys_size; ++i)
+    {
+        if (key_sizes[i] == sizeof(T))
+        {
+            out.resize_fill(end - begin);
+
+            /// Note: here we violate strict aliasing, as fillFixedBatch does.
+            const char * source = static_cast<const ColumnFixedSizeHelper *>(key_columns[i])->getRawDataBegin<sizeof(T)>();
+            T * dest = reinterpret_cast<T *>(reinterpret_cast<char *>(out.data()) + offset);
+            fillFixedBatch<T, sizeof(Key) / sizeof(T)>(end - begin, reinterpret_cast<const T *>(source) + begin, dest);
+            offset += sizeof(T);
+        }
+    }
+}
+
+/// Same as packFixedBatch, but only over rows [begin, end), which must be a non-empty range.
+template <typename T>
+void packFixedBatchRange(
+    size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes, PaddedPODArray<T> & out, size_t begin, size_t end)
+{
+    size_t offset = 0;
+    fillFixedBatchRange<UInt128>(keys_size, key_columns, key_sizes, begin, end, out, offset);
+    fillFixedBatchRange<UInt64>(keys_size, key_columns, key_sizes, begin, end, out, offset);
+    fillFixedBatchRange<UInt32>(keys_size, key_columns, key_sizes, begin, end, out, offset);
+    fillFixedBatchRange<UInt16>(keys_size, key_columns, key_sizes, begin, end, out, offset);
+    fillFixedBatchRange<UInt8>(keys_size, key_columns, key_sizes, begin, end, out, offset);
+}
+
+template <size_t size, typename Key>
+void fillFixedBatchOrdered(size_t num_rows, const char * source, char * dest)
+{
+    for (size_t i = 0; i < num_rows; ++i)
+    {
+        memcpy(dest, source, size);
+        source += size;
+        dest += sizeof(Key);
+    }
+}
+
+/// Packs rows [begin, end) in clause order after `offset` zero bytes, which is the layout of the nullable
+/// `packFixed` for a row without NULLs. Element `i` of `out` is row `begin + i`.
+template <typename Key>
+void packFixedBatchOrdered(
+    size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes, size_t offset,
+    PaddedPODArray<Key> & out, size_t begin, size_t end)
+{
+    const size_t num_rows = end - begin;
+    out.resize_fill(num_rows);
+
+    char * dest = reinterpret_cast<char *>(out.data()) + offset;
+    for (size_t j = 0; j < keys_size; ++j)
+    {
+        const size_t size = key_sizes[j];
+        const char * source = static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<1>() + begin * size;
+        switch (size)
+        {
+            case 1: fillFixedBatchOrdered<1, Key>(num_rows, source, dest); break;
+            case 2: fillFixedBatchOrdered<2, Key>(num_rows, source, dest); break;
+            case 4: fillFixedBatchOrdered<4, Key>(num_rows, source, dest); break;
+            case 8: fillFixedBatchOrdered<8, Key>(num_rows, source, dest); break;
+            case 16: fillFixedBatchOrdered<16, Key>(num_rows, source, dest); break;
+            default:
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected key size {} for batch packing", size);
+        }
+        dest += size;
+    }
+}
+
+template <typename Key, size_t ELEMENT_SIZE>
+static inline void ALWAYS_INLINE fillFixedLongestFirst(
+    size_t row, size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes, char * bytes, size_t & offset)
+{
+    if constexpr (sizeof(Key) >= ELEMENT_SIZE)   /// To avoid warning about memcpy exceeding object size.
+    {
+        for (size_t i = 0; i < keys_size; ++i)
+        {
+            if (key_sizes[i] != ELEMENT_SIZE)
+                continue;
+
+            const char * source = static_cast<const ColumnFixedSizeHelper *>(key_columns[i])->getRawDataBegin<1>();
+            memcpy(bytes + offset, source + row * ELEMENT_SIZE, ELEMENT_SIZE);
+            offset += ELEMENT_SIZE;
+        }
+    }
+}
+
+/// Pack the keys of a single row into a binary blob of type Key, laid out exactly as packFixedBatch
+/// lays out the same key set: one pass per key width, longest first. That order is load-bearing,
+/// because shuffleKeyColumns makes the output side read the blob back in it when usePreparedKeys holds.
+template <typename Key>
+static NO_INLINE Key packFixedLongestFirst(
+    size_t row, size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes)
+{
+    Key key{};
+    char * bytes = reinterpret_cast<char *>(&key);
+    size_t offset = 0;
+
+    fillFixedLongestFirst<Key, 16>(row, keys_size, key_columns, key_sizes, bytes, offset);
+    fillFixedLongestFirst<Key, 8>(row, keys_size, key_columns, key_sizes, bytes, offset);
+    fillFixedLongestFirst<Key, 4>(row, keys_size, key_columns, key_sizes, bytes, offset);
+    fillFixedLongestFirst<Key, 2>(row, keys_size, key_columns, key_sizes, bytes, offset);
+    fillFixedLongestFirst<Key, 1>(row, keys_size, key_columns, key_sizes, bytes, offset);
+
+    return key;
+}
+
+/// Pack into a binary blob of type T a set of fixed-size keys. Granted that all the keys fit into the
+/// binary blob, they are disposed in it consecutively.
+template <typename T, bool has_low_cardinality = false>
+static inline T ALWAYS_INLINE packFixed(
+    size_t i, size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes,
+    const ColumnRawPtrs * low_cardinality_positions [[maybe_unused]] = nullptr,
+    const Sizes * low_cardinality_sizes [[maybe_unused]] = nullptr)
+{
+    T key{};
+    char * bytes = reinterpret_cast<char *>(&key);
+    size_t offset = 0;
+
+    for (size_t j = 0; j < keys_size; ++j)
+    {
+        size_t index = i;
+        const IColumn * column = key_columns[j];
+        if constexpr (has_low_cardinality)
+        {
+            if (const IColumn * positions = (*low_cardinality_positions)[j])
+            {
+                switch ((*low_cardinality_sizes)[j])
+                {
+                    case sizeof(UInt8): index = assert_cast<const ColumnUInt8 *>(positions)->getElement(i); break;
+                    case sizeof(UInt16): index = assert_cast<const ColumnUInt16 *>(positions)->getElement(i); break;
+                    case sizeof(UInt32): index = assert_cast<const ColumnUInt32 *>(positions)->getElement(i); break;
+                    case sizeof(UInt64): index = assert_cast<const ColumnUInt64 *>(positions)->getElement(i); break;
+                    default: throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of index type for low cardinality column.");
+                }
+            }
+        }
+
+        switch (key_sizes[j])
+        {
+            case 1:
+                {
+                    memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<1>() + index, 1);
+                    offset += 1;
+                }
+                break;
+            case 2:
+                if constexpr (sizeof(T) >= 2)   /// To avoid warning about memcpy exceeding object size.
+                {
+                    memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<2>() + index * 2, 2);
+                    offset += 2;
+                }
+                break;
+            case 4:
+                if constexpr (sizeof(T) >= 4)
+                {
+                    memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<4>() + index * 4, 4);
+                    offset += 4;
+                }
+                break;
+            case 8:
+                if constexpr (sizeof(T) >= 8)
+                {
+                    memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<8>() + index * 8, 8);
+                    offset += 8;
+                }
+                break;
+            default:
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(column)->getRawDataBegin<1>() + index * key_sizes[j], key_sizes[j]);
+                offset += key_sizes[j];
+        }
+    }
+
+    return key;
+}
+
+/// Similar as above but supports nullable values.
+template <typename T>
+static inline T ALWAYS_INLINE packFixed(
+    size_t i, size_t keys_size, const ColumnRawPtrs & key_columns, const Sizes & key_sizes,
+    const KeysNullMap<T> & bitmap)
+{
+    union
+    {
+        T key;
+        char bytes[sizeof(key)] = {};
+    };
+
+    size_t offset = 0;
+
+    static constexpr auto bitmap_size = std::tuple_size_v<KeysNullMap<T>>;
+    static constexpr bool has_bitmap = bitmap_size > 0;
+
+    if constexpr (has_bitmap)
+    {
+        memcpy(bytes + offset, bitmap.data(), bitmap_size * sizeof(UInt8));
+        offset += bitmap_size;
+    }
+
+    for (size_t j = 0; j < keys_size; ++j)
+    {
+        bool is_null = false;
+
+        if (!has_bitmap)
+            is_null = false;
+        else
+        {
+            size_t bucket = j / 8;
+            size_t off = j % 8;
+            is_null = ((bitmap[bucket] >> off) & 1) == 1;
+        }
+
+        if (is_null)
+            continue;
+
+        switch (key_sizes[j])
+        {
+            case 1:
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<1>() + i, 1);
+                offset += 1;
+                break;
+            case 2:
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<2>() + i * 2, 2);
+                offset += 2;
+                break;
+            case 4:
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<4>() + i * 4, 4);
+                offset += 4;
+                break;
+            case 8:
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<8>() + i * 8, 8);
+                offset += 8;
+                break;
+            default:
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<1>() + i * key_sizes[j], key_sizes[j]);
+                offset += key_sizes[j];
+        }
+    }
+
+    return key;
+}
+
+/** Serialize keys into a continuous chunk of memory.
+  */
+static inline std::string_view ALWAYS_INLINE serializeKeysToPoolContiguous( /// NOLINT
+    size_t i, size_t keys_size, const ColumnRawPtrs & key_columns, Arena & pool, const IColumn::SerializationSettings * settings)
+{
+    const char * begin = nullptr;
+
+    size_t sum_size = 0;
+    for (size_t j = 0; j < keys_size; ++j)
+        sum_size += key_columns[j]->serializeValueIntoArena(i, pool, begin, settings).size();
+
+    return {begin, sum_size};
+}
+
+
+/** Pack elements with shuffle instruction.
+  * See the explanation in ColumnsHashing.h
+  */
+#if defined(__SSSE3__) && !defined(MEMORY_SANITIZER)
+template <typename T>
+static T inline packFixedShuffle(
+    const char * __restrict * __restrict srcs,
+    size_t num_srcs,
+    const size_t * __restrict elem_sizes,
+    size_t idx,
+    const uint8_t * __restrict masks)
+{
+    chassert(num_srcs > 0);
+
+    __m128i res = _mm_shuffle_epi8(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(srcs[0] + elem_sizes[0] * idx)),
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(masks)));
+
+    for (size_t i = 1; i < num_srcs; ++i)
+    {
+        res = _mm_xor_si128(res,
+            _mm_shuffle_epi8(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(srcs[i] + elem_sizes[i] * idx)),
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(&masks[i * sizeof(T)]))));
+    }
+
+    T out{};
+    __builtin_memcpy(&out, &res, sizeof(T));
+    return out;
+}
+#endif
+
+}

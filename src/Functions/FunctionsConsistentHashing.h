@@ -1,0 +1,152 @@
+#pragma once
+
+#include <Columns/ColumnConst.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
+#include <base/IPv4andIPv6.h>
+#include <Interpreters/Context_fwd.h>
+
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int BAD_ARGUMENTS;
+}
+
+
+template <typename Impl>
+class FunctionConsistentHashImpl final : public IFunction
+{
+public:
+    static constexpr auto name = Impl::name;
+
+    static FunctionPtr create(ContextPtr)
+    {
+        return std::make_shared<FunctionConsistentHashImpl<Impl>>();
+    }
+
+    [[nodiscard]] String getName() const override
+    {
+        return name;
+    }
+
+    [[nodiscard]] size_t getNumberOfArguments() const override
+    {
+        return 2;
+    }
+
+    [[nodiscard]] bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
+    [[nodiscard]] String getSignatureString() const override
+    {
+        /// executeImpl only supports NativeInteger/IPv4 for the hash value; the second arg
+        /// (number of buckets) must be a constant native integer — wide (128/256-bit)
+        /// integers are read via getUInt/getInt and would be silently truncated to 64 bits.
+        const String ret = DataTypeNumber<typename Impl::ResultType>{}.getName();
+        return "(NativeInteger | IPv4, const NativeInteger) -> " + ret;
+    }
+
+    [[nodiscard]] DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
+        return std::make_shared<DataTypeNumber<ResultType>>();
+    }
+
+    [[nodiscard]] bool useDefaultImplementationForConstants() const override
+    {
+        return true;
+    }
+
+    /// Disable default Variant implementation for compatibility.
+    /// Hash values must remain stable, so we don't want the Variant adaptor to change hash computation.
+    [[nodiscard]] bool useDefaultImplementationForVariant() const override { return false; }
+
+    [[nodiscard]] ColumnNumbers getArgumentsThatAreAlwaysConstant() const override
+    {
+        return {1};
+    }
+
+    [[nodiscard]] ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t /*input_rows_count*/) const override
+    {
+        if (isColumnConst(*arguments[1].column))
+            return executeConstBuckets(arguments);
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The second argument of function {} (number of buckets) must be constant", getName());
+    }
+
+private:
+    using HashType = typename Impl::HashType;
+    using ResultType = typename Impl::ResultType;
+    using BucketsType = typename Impl::BucketsType;
+
+    template <typename T>
+    [[nodiscard]] BucketsType checkBucketsRange(T buckets) const
+    {
+        if (unlikely(buckets <= 0))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The second argument of function {} (number of buckets) must be positive number", getName());
+
+        if (unlikely(static_cast<UInt64>(buckets) > Impl::max_buckets))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The value of the second argument of function {} "
+                            "(number of buckets) must not be greater than {}", getName(), Impl::max_buckets);
+
+        return static_cast<BucketsType>(buckets);
+    }
+
+    [[nodiscard]] ColumnPtr executeConstBuckets(const ColumnsWithTypeAndName & arguments) const
+    {
+        /// `getReturnTypeImpl` already verified `arguments[1]` is an integer; read it directly to avoid an intermediate `Field`.
+        const IColumn & buckets_col = *arguments[1].column;
+        BucketsType num_buckets = WhichDataType(arguments[1].type).isUInt()
+            ? checkBucketsRange(buckets_col.getUInt(0))
+            : checkBucketsRange(buckets_col.getInt(0));
+
+        const auto & hash_col = arguments[0].column;
+        const IDataType * hash_type = arguments[0].type.get();
+        auto res_col = ColumnVector<ResultType>::create();
+
+        WhichDataType which(hash_type);
+
+        if (which.isUInt8())
+            executeType<UInt8>(hash_col, num_buckets, res_col.get());
+        else if (which.isUInt16())
+            executeType<UInt16>(hash_col, num_buckets, res_col.get());
+        else if (which.isUInt32())
+            executeType<UInt32>(hash_col, num_buckets, res_col.get());
+        else if (which.isUInt64())
+            executeType<UInt64>(hash_col, num_buckets, res_col.get());
+        else if (which.isInt8())
+            executeType<Int8>(hash_col, num_buckets, res_col.get());
+        else if (which.isInt16())
+            executeType<Int16>(hash_col, num_buckets, res_col.get());
+        else if (which.isInt32())
+            executeType<Int32>(hash_col, num_buckets, res_col.get());
+        else if (which.isInt64())
+            executeType<Int64>(hash_col, num_buckets, res_col.get());
+        else if (which.isIPv4())
+            executeType<IPv4>(hash_col, num_buckets, res_col.get());
+        else
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of the first argument of function {}",
+                hash_type->getName(), getName());
+
+        return res_col;
+    }
+
+    template <typename CurrentHashType>
+    void executeType(const ColumnPtr & col_hash_ptr, BucketsType num_buckets, ColumnVector<ResultType> * col_result) const
+    {
+        auto col_hash = checkAndGetColumn<ColumnVector<CurrentHashType>>(col_hash_ptr.get());
+        if (!col_hash)
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type of the first argument of function {}", getName());
+
+        auto & vec_result = col_result->getData();
+        const auto & vec_hash = col_hash->getData();
+
+        size_t size = vec_hash.size();
+        vec_result.resize(size);
+        for (size_t i = 0; i < size; ++i)
+            vec_result[i] = Impl::apply(static_cast<HashType>(vec_hash[i]), num_buckets);
+    }
+};
+
+}

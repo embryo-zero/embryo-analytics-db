@@ -1,0 +1,90 @@
+#pragma once
+
+#include <Functions/FunctionFactory.h>
+#include <Functions/FunctionHelpers.h>
+#include <Functions/StringHelpers.h>
+#include <Columns/ColumnString.h>
+#include <Common/TLDListsHolder.h>
+
+namespace DB
+{
+
+namespace ErrorCodes
+{
+    extern const int ILLEGAL_COLUMN;
+}
+
+struct FirstSignificantSubdomainCustomLookup
+{
+    const TLDList & tld_list;
+    explicit FirstSignificantSubdomainCustomLookup(const std::string & tld_list_name)
+        : tld_list(TLDListsHolder::getInstance().getTldList(tld_list_name))
+    {
+    }
+
+    TLDType operator()(std::string_view host) const
+    {
+        return tld_list.lookup(host);
+    }
+};
+
+template <typename Extractor, typename Name>
+class FunctionCutToFirstSignificantSubdomainCustomImpl final : public IFunction
+{
+public:
+    static constexpr auto name = Name::name;
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionCutToFirstSignificantSubdomainCustomImpl>(); }
+
+    [[nodiscard]] String getName() const override { return name; }
+    [[nodiscard]] size_t getNumberOfArguments() const override { return 2; }
+    [[nodiscard]] bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
+    [[nodiscard]] bool useDefaultImplementationForConstants() const override { return true; }
+    [[nodiscard]] ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
+
+    [[nodiscard]] String getSignatureString() const override { return "(String, const StringOrFixedString) -> String"; }
+
+    [[nodiscard]] ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & /*result_type*/, size_t input_rows_count) const override
+    {
+        const ColumnConst * column_tld_list_name = checkAndGetColumnConstStringOrFixedString(arguments[1].column.get());
+        FirstSignificantSubdomainCustomLookup tld_lookup(column_tld_list_name->getValue<String>());
+
+        if (const ColumnString * col = checkAndGetColumn<ColumnString>(&*arguments[0].column))
+        {
+            auto col_res = ColumnString::create();
+            vector(tld_lookup, col->getChars(), col->getOffsets(), col_res->getChars(), col_res->getOffsets(), input_rows_count);
+            return col_res;
+        }
+        throw Exception(
+            ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}", arguments[0].column->getName(), getName());
+    }
+
+    static void vector(FirstSignificantSubdomainCustomLookup & tld_lookup,
+        const ColumnString::Chars & data, const ColumnString::Offsets & offsets,
+        ColumnString::Chars & res_data, ColumnString::Offsets & res_offsets,
+        size_t input_rows_count)
+    {
+        res_offsets.resize(input_rows_count);
+        res_data.reserve(input_rows_count * Extractor::getReserveLengthForElement());
+
+        size_t prev_offset = 0;
+        size_t res_offset = 0;
+
+        /// Matched part.
+        Pos start = nullptr;
+        size_t length = 0;
+
+        for (size_t i = 0; i < input_rows_count; ++i)
+        {
+            Extractor::execute(tld_lookup, reinterpret_cast<const char *>(&data[prev_offset]), offsets[i] - prev_offset, start, length);
+
+            res_data.resize(res_data.size() + length);
+            memcpySmallAllowReadWriteOverflow15(&res_data[res_offset], start, length);
+            res_offset += length;
+            res_offsets[i] = res_offset;
+            prev_offset = offsets[i];
+        }
+    }
+};
+
+}

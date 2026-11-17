@@ -1,0 +1,128 @@
+#pragma once
+
+#include <Storages/MergeTree/Compaction/MergeSelectors/IMergeSelector.h>
+#include <Storages/MergeTree/Compaction/MergeSelectors/DisjointPartsRangesSet.h>
+#include <Storages/TTLDescription.h>
+
+namespace DB
+{
+
+using PartitionIdToTTLs = std::map<String, time_t>;
+
+/** Merge selector, which is used to remove values with expired ttl.
+  * It selects parts to merge by greedy algorithm:
+  *  1. Finds part with the most earliest expired ttl and includes it to result.
+  *  2. Tries to find the longest range of parts with expired ttl, that includes part from step 1.
+  */
+class ITTLMergeSelector : public IMergeSelector
+{
+    class MergeRangesConstructor;
+    friend class MergeRangesConstructor;
+
+public:
+    ITTLMergeSelector(const PartitionIdToTTLs * merge_due_times_, time_t current_time_, size_t max_parts_to_merge_at_once_ = 0);
+
+    [[nodiscard]] PartsRanges select(
+        const PartsRanges & parts_ranges,
+        const MergeConstraints & merge_constraints,
+        const RangeFilter & range_filter) const override;
+
+protected:
+    /// Get TTL value for part, may depend on child type and some settings in constructor.
+    [[nodiscard]] virtual time_t getTTLForPart(const PartProperties & part) const = 0;
+
+    /// Returns true if part can be used during ranges building process.
+    [[nodiscard]] virtual bool canConsiderPart(const PartProperties & part) const = 0;
+
+private:
+    struct CenterPosition
+    {
+        RangesIterator range;
+        PartsIterator center;
+        time_t ttl{};
+    };
+
+    [[nodiscard]] bool needToPostponePartition(const std::string & partition_id) const;
+
+    [[nodiscard]] std::vector<CenterPosition> findCenters(const PartsRanges & parts_ranges) const;
+
+    PartsIterator findLeftRangeBorder(
+        const CenterPosition & center_position,
+        size_t & usable_memory,
+        size_t & usable_rows,
+        size_t & usable_parts,
+        DisjointPartsRangesSet & disjoint_set) const;
+
+    PartsIterator findRightRangeBorder(
+        const CenterPosition & center_position,
+        size_t & usable_memory,
+        size_t & usable_rows,
+        size_t & usable_parts,
+        DisjointPartsRangesSet & disjoint_set) const;
+
+    const time_t current_time;
+    const PartitionIdToTTLs * merge_due_times;
+    const size_t max_parts_to_merge_at_once;
+};
+
+/// Select parts that must be fully deleted because of ttl for part.
+class TTLPartDropMergeSelector : public ITTLMergeSelector
+{
+public:
+    explicit TTLPartDropMergeSelector(time_t current_time_, size_t max_parts_to_drop_at_once_);
+
+private:
+    [[nodiscard]] time_t getTTLForPart(const PartProperties & part) const override;
+
+    /// Actually does not check anything. Allows to use any part.
+    [[nodiscard]] bool canConsiderPart(const PartProperties & part) const override;
+};
+
+/// Select parts that have some expired row ttls.
+class TTLRowDeleteMergeSelector : public ITTLMergeSelector
+{
+public:
+    explicit TTLRowDeleteMergeSelector(const PartitionIdToTTLs & merge_due_times_, time_t current_time_);
+
+private:
+    [[nodiscard]] time_t getTTLForPart(const PartProperties & part) const override;
+
+    /// Checks that part has at least one unfinished row ttl. Because if all ttls
+    /// are finished for part - it will be considered by TTLPartDropMergeSelector.
+    [[nodiscard]] bool canConsiderPart(const PartProperties & part) const override;
+};
+
+/// Select parts that have some expired column ttls.
+///
+/// A column TTL can only be honoured by rewriting the part - dropping the part is not an alternative
+/// way of clearing a column - so this selector runs regardless of `ttl_only_drop_parts`, unlike
+/// `TTLRowDeleteMergeSelector`.
+class TTLColumnDeleteMergeSelector : public ITTLMergeSelector
+{
+public:
+    explicit TTLColumnDeleteMergeSelector(const PartitionIdToTTLs & merge_due_times_, time_t current_time_);
+
+private:
+    /// Returns the earliest due time among the unfinished column TTLs of the part, so that a row TTL
+    /// that expires earlier does not make the part eligible before a column TTL is actually due.
+    [[nodiscard]] time_t getTTLForPart(const PartProperties & part) const override;
+
+    [[nodiscard]] bool canConsiderPart(const PartProperties & part) const override;
+};
+
+/// Select parts to merge using information about recompression TTL and compression codec of existing parts.
+class TTLRecompressMergeSelector : public ITTLMergeSelector
+{
+public:
+    explicit TTLRecompressMergeSelector(const PartitionIdToTTLs & merge_due_times_, time_t current_time_);
+
+private:
+    /// Return part min recompression TTL.
+    [[nodiscard]] time_t getTTLForPart(const PartProperties & part) const override;
+
+    /// Checks that part's codec is not already equal to required codec
+    /// according to recompression TTL. It doesn't make sense to assign such merge.
+    [[nodiscard]] bool canConsiderPart(const PartProperties & part) const override;
+};
+
+}

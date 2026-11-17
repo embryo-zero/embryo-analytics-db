@@ -1,0 +1,118 @@
+#include <Functions/FunctionFactory.h>
+#include <Functions/GeoHash.h>
+#include <Functions/FunctionHelpers.h>
+
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnFixedString.h>
+#include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnTuple.h>
+#include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypesNumber.h>
+
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int ILLEGAL_COLUMN;
+}
+
+namespace
+{
+
+// geohashDecode(string) => (lon float64, lat float64)
+class FunctionGeohashDecode final : public IFunction
+{
+public:
+    static constexpr auto name = "geohashDecode";
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionGeohashDecode>(); }
+
+    [[nodiscard]] String getName() const override
+    {
+        return name;
+    }
+
+    [[nodiscard]] size_t getNumberOfArguments() const override { return 1; }
+    [[nodiscard]] bool useDefaultImplementationForConstants() const override { return true; }
+    [[nodiscard]] bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
+    [[nodiscard]] String getSignatureString() const override
+    {
+        return "(StringOrFixedString) -> Tuple(longitude Float64, latitude Float64)";
+    }
+
+    template <typename ColumnTypeEncoded>
+    bool tryExecute(const IColumn * encoded_column, ColumnPtr & result_column, size_t input_rows_count) const
+    {
+        const auto * encoded = checkAndGetColumn<ColumnTypeEncoded>(encoded_column);
+        if (!encoded)
+            return false;
+
+        auto latitude = ColumnFloat64::create(input_rows_count);
+        auto longitude = ColumnFloat64::create(input_rows_count);
+
+        ColumnFloat64::Container & lon_data = longitude->getData();
+        ColumnFloat64::Container & lat_data = latitude->getData();
+
+        for (size_t i = 0; i < input_rows_count; ++i)
+        {
+            std::string_view encoded_string = encoded->getDataAt(i);
+            geohashDecode(encoded_string.data(), encoded_string.size(), &lon_data[i], &lat_data[i]);
+        }
+
+        MutableColumns result;
+        result.emplace_back(std::move(longitude));
+        result.emplace_back(std::move(latitude));
+        result_column = ColumnTuple::create(std::move(result));
+
+        return true;
+    }
+
+    [[nodiscard]] ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        const IColumn * encoded = arguments[0].column.get();
+        ColumnPtr res_column;
+
+        if (tryExecute<ColumnString>(encoded, res_column, input_rows_count) ||
+            tryExecute<ColumnFixedString>(encoded, res_column, input_rows_count))
+            return res_column;
+
+        throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Unsupported argument type:{} of argument of function {}",
+                        arguments[0].column->getName(), getName());
+    }
+};
+
+}
+
+REGISTER_FUNCTION(GeohashDecode)
+{
+    FunctionDocumentation::Description description = R"(
+Decodes any [geohash](https://en.wikipedia.org/wiki/Geohash)-encoded string into longitude and latitude coordinates.
+    )";
+    FunctionDocumentation::Syntax syntax = "geohashDecode(hash_str)";
+    FunctionDocumentation::Arguments arguments = {
+        {"hash_str", "Geohash-encoded string to decode.", {"String", "FixedString"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {
+        "Returns a tuple of `(longitude, latitude)` with `Float64` precision.",
+        {"Tuple(Float64, Float64)"}
+    };
+    FunctionDocumentation::Examples examples = {
+        {
+            "Basic usage",
+            "SELECT geohashDecode('ezs42') AS res",
+            R"(
+┌─res─────────────────────────────┐
+├──────longitude─┬───────latitude─┤
+│ -5.60302734375 │ 42.60498046875 │
+└────────────────┴────────────────┘
+            )"
+        }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Geo;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionGeohashDecode>(documentation);
+}
+
+}
